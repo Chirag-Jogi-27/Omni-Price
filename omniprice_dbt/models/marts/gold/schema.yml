@@ -1,0 +1,81 @@
+version: 2
+
+models:
+  - name: price_daily_enriched
+    description: >
+      Core daily price mart at the grain of (asin, snapshot_date).
+      Enriches price observations with master product specifications (brand, 
+      normalized quantity, pack unit) and standardizes unit pricing (e.g. price per 100g / 100ml / 1 count).
+    columns:
+      - name: asin_snapshot_date
+        description: Surrogate primary key composed of asin and snapshot_date.
+        tests:
+          - unique
+          - not_null
+
+      - name: asin
+        description: Amazon Standard Identification Number.
+        tests:
+          - not_null
+
+      - name: snapshot_date
+        description: Calendar business date of the price observation.
+        tests:
+          - not_null
+
+      - name: price
+        description: Current selling price in INR. Null when product is out-of-stock.
+
+      - name: is_price_gt_mrp
+        description: Data quality anomaly flag indicating if selling price exceeds MRP.
+        tests:
+          - not_null
+
+  - name: category_daily
+    description: >
+      Daily market index aggregated by FMCG micro-category and search category.
+      Tracks catalog depth, average selling price, average category discount,
+      average rating, and sponsored brand search share over time.
+    columns:
+      - name: micro_category__search_category__snapshot_date
+        description: Surrogate primary key for category daily snapshot.
+        tests:
+          - unique
+          - not_null
+
+      - name: snapshot_date
+        description: Calendar business date of the category aggregate.
+        tests:
+          - not_null
+
+      - name: product_count
+        description: Number of active products observed in this category on this date.
+        tests:
+          - not_null
+
+  - name: shrinkflation_alert
+    description: >
+      Audit log and alert mart for stealth price increases (shrinkflation).
+      Fires when an ASIN's physical quantity/weight is reduced (shrink_pct > 0)
+      across consecutive versions in the SCD Type 2 history table.
+    columns:
+      - name: spec_change_event_key
+        description: Surrogate primary key composed of asin and change_date.
+        tests:
+          - unique
+          - not_null
+
+      - name: asin
+        description: Amazon Standard Identification Number for the shrunk product.
+        tests:
+          - not_null
+
+      - name: shrink_pct
+        description: Percentage reduction in pack quantity/weight.
+        tests:
+          - not_null
+
+      - name: change_date
+        description: Date when the specification reduction was first detected.
+        tests:
+          - not_null

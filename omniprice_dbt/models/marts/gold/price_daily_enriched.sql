@@ -63,4 +63,5 @@ select
 from price p
 left join history h
   on h.asin = p.asin
- and p.snapshot_date between h.valid_from and h.valid_to
+ and p.snapshot_date >= h.valid_from
+ and (p.snapshot_date < h.valid_to or h.valid_to = '9999-12-31')

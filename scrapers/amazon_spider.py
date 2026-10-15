@@ -43,8 +43,8 @@ def _first(item, *selectors):
 
 class AmazonOPI_Spider(Spider):
     name = "amazon_bronze_spider"
-    concurrent_requests = 1
-    download_delay = 1.2
+    concurrent_requests = 2
+    download_delay = 0.6
 
     def configure_sessions(self, manager):
         manager.add(
@@ -313,16 +313,9 @@ if __name__ == "__main__":
         )
         logger.info(f"Raw data saved to {output_file}; manifest={manifest_file}")
 
-        # Automatically coordinate discovered ASINs into CatalogTracker!
+        # Automatically coordinate discovered ASINs into CatalogTracker with shelf_hash & velocity tiering
         tracker = CatalogTracker()
-        tracker.register_discovered_asins([
-            {
-                "asin": it.get("asin"),
-                "search_category": it.get("search_category"),
-                "leaf_node_id": ""
-            }
-            for it in result.items if it.get("asin")
-        ], source="search_shelf")
-        logger.info(f"Indexed all discovered shelf ASINs into CatalogTracker state.")
+        tracker.register_discovered_asins([it for it in result.items if it.get("asin")], source="search_shelf")
+        logger.info(f"Indexed all discovered shelf ASINs into CatalogTracker state with shelf_hash.")
     else:
         logger.warning(f"No items scraped. (Elapsed: {t_elapsed:.2f}s). Check logs for errors.")

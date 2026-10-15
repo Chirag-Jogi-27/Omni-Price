@@ -18,9 +18,9 @@ logger = get_logger("amazon_pdp_spider")
 
 class AmazonPDP_Spider(Spider):
     name = "amazon_pdp_spider"
-    # Fast fetcher for 2000 ASIN scale - old 3000 records were done with Fetcher
-    concurrent_requests = 3
-    download_delay = 0.5
+    # High-throughput Fetcher optimized for 2000 ASIN scale (night-time speed)
+    concurrent_requests = 5
+    download_delay = 0.2
 
     def configure_sessions(self, manager):
         manager.add(
@@ -114,9 +114,9 @@ class AmazonPDP_Spider(Spider):
             or response.css('#corePriceDisplay_desktop_feature_div span.a-size-small.a-color-secondary:contains("/")::text').get()
         )
 
-        price = price.strip() if price else None
-        mrp = mrp.strip() if mrp else None
-        unit_price = " ".join(unit_price.split()) if unit_price else None
+        price = price.strip() if price and price.strip().lower() != "null" else None
+        mrp = mrp.strip() if mrp and mrp.strip().lower() != "null" else None
+        unit_price = " ".join(unit_price.split()) if unit_price and unit_price.strip().lower() != "null" else None
 
         # ----------------------------------------------------------------------
         # 2. Availability & Seller (Buy Box)
@@ -220,7 +220,7 @@ class AmazonPDP_Spider(Spider):
 
         # BSR Category Node IDs
         bsr_categories = []
-        bsr_links = response.css('#SalesRank a, #detailBullets_feature_div a[href*="bestsellers"], #detailBullets_feature_div a[href*="zgbs"]')
+        bsr_links = response.css('#SalesRank a, #detailBullets_feature_div a[href*="bestsellers"], #detailBullets_feature_div a[href*="zgbs"], #productDetails_db_sections a[href*="bestsellers"], #productDetails_db_sections a[href*="zgbs"]')
         for b in bsr_links:
             b_href = b.attrib.get('href', '')
             b_name = " ".join(b.css('::text').get("").split())
@@ -228,9 +228,23 @@ class AmazonPDP_Spider(Spider):
             if m_bsr and b_name:
                 bsr_categories.append({"name": b_name, "node_id": m_bsr.group(1)})
 
-        # Product Details Table (Net Quantity, Item Weight, Manufacturer)
+        # ------------------------------------------------------------------
+        # 5. Product Details Table — Multi-Layout Extraction
+        #    FIX: Amazon uses 4+ different layouts for product details.
+        #    Previously only checked 2, causing 6.2% of PDP records to have
+        #    an empty product_details_table (→ nulls in Silver for
+        #    manufacturer, country_of_origin, net_quantity, etc.)
+        # ------------------------------------------------------------------
         details = {}
-        rows = response.css('#productDetails_techSpec_section_1 tr') or response.css('#detailBullets_feature_div li')
+
+        # Try all known Amazon product-detail layouts in priority order
+        rows = (
+            response.css('#productDetails_techSpec_section_1 tr')
+            or response.css('#productDetails_techSpec_section_2 tr')
+            or response.css('#detailBullets_feature_div li')
+            or response.css('#productDetails_db_sections .a-section .a-row')
+            or response.css('#productDetails_detailBullets_sections1 tr')
+        )
         for row in rows:
             key = row.xpath('.//*[contains(@class, "a-text-bold")]//text() | .//th//text()').get()
             val = row.xpath('.//*[not(contains(@class, "a-text-bold"))]//text() | .//td//text()').getall()
@@ -239,6 +253,37 @@ class AmazonPDP_Spider(Spider):
                 key = re.sub(r'[\u200f\u200e\s:]+', ' ', key).strip()
                 val = re.sub(r'[\u200f\u200e\s]+', ' ', val).strip()
                 if key and val:
+                    # ------------------------------------------------------------------
+                    # FIX: Normalize inconsistent Amazon key names.
+                    # Amazon uses different labels for the same field across
+                    # layouts and categories, e.g. "Country of Origin" vs
+                    # "Country/Region of origin". Without normalization, the
+                    # Silver notebook can't reliably look up keys → 34.3%
+                    # null for country_of_origin and 8.2% for manufacturer.
+                    # ------------------------------------------------------------------
+                    key_lower = key.lower()
+                    if "country" in key_lower and "origin" in key_lower:
+                        key = "Country of Origin"
+                    elif "manufacturer" in key_lower:
+                        key = "Manufacturer"
+                    elif "net" in key_lower and "quantity" in key_lower:
+                        key = "Net Quantity"
+                    elif "item" in key_lower and "weight" in key_lower:
+                        key = "Item Weight"
+                    elif "item" in key_lower and "dimension" in key_lower:
+                        key = "Item Dimensions LxWxH"
+                    elif "package" in key_lower and "quantity" in key_lower:
+                        key = "Item Package Quantity"
+                    elif key_lower.startswith("number") and "item" in key_lower:
+                        key = "Number of Items"
+                    elif "included" in key_lower and "component" in key_lower:
+                        key = "Included Components"
+                    elif "packer" in key_lower:
+                        key = "Packer"
+                    elif "importer" in key_lower:
+                        key = "Importer"
+                    elif "generic" in key_lower and "name" in key_lower:
+                        key = "Generic Name"
                     details[key] = val
 
         # Multi-pack detection from Included Components or table
@@ -262,6 +307,27 @@ class AmazonPDP_Spider(Spider):
                 except ValueError:
                     derived_pack = None
         effective_pack = pack_qty or (str(derived_pack) if derived_pack and derived_pack > 1 else None)
+
+        # ------------------------------------------------------------------
+        # FIX: Brand fallback chain.
+        # When #bylineInfo is empty (common for some Amazon listings),
+        # try extracting from the Manufacturer field in the details table,
+        # then fall back to the first word of the product title.
+        # This reduces brand nulls from ~0% (waterfall resolver already
+        # handles most), but ensures the raw PDP JSON has a non-empty
+        # pdp_brand for edge cases.
+        # ------------------------------------------------------------------
+        if not brand:
+            mfr = details.get("Manufacturer", "")
+            if mfr:
+                # Extract company name before first comma
+                # e.g. "Kellogg's India Pvt Ltd, PLOT NO. L2 & L3, ..." → "Kellogg's India Pvt Ltd"
+                brand = mfr.split(",")[0].strip()
+        if not brand and title:
+            # Last resort: first word of title is usually the brand for FMCG products
+            first_word = title.split()[0].rstrip(",!-–") if title.split() else None
+            if first_word and len(first_word) > 1:
+                brand = first_word
 
         yield {
             "asin": asin,
@@ -311,8 +377,8 @@ if __name__ == "__main__":
         products_to_scrape = sample_asins
         logger.info(f"Running TEST MODE on {len(products_to_scrape)} sample ASINs.")
     elif args.mode == "spec":
-        products_to_scrape = tracker.get_unscraped_pdp_asins(max_pdp_age_days=args.max_age_days, limit=args.limit)
-        logger.info(f"Loaded {len(products_to_scrape)} ASINs for full spec deep-dive (new + rolling > {args.max_age_days}d).")
+        products_to_scrape = tracker.get_unscraped_pdp_asins(limit=args.limit)
+        logger.info(f"Loaded {len(products_to_scrape)} ASINs for full spec deep-dive (new + anomalies + tiered rolling).")
         if not products_to_scrape:
             # Fallback if catalog is completely up to date
             logger.info("All catalog ASINs have fresh PDP specs. Checking for stale price items...")

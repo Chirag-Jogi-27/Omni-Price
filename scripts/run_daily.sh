@@ -38,6 +38,9 @@ else
     echo "⚠️ venv not found at $PROJECT_ROOT/venv, using system python3"
 fi
 
+# Set PYTHONPATH so 'core' and other modules resolve from root
+export PYTHONPATH="${PROJECT_ROOT}:${PYTHONPATH:-}"
+
 START_TIME=$(date +%s)
 
 # ------------------------------------------------------------------------------
@@ -47,7 +50,7 @@ echo ""
 echo "------------------------------------------------------------------------"
 echo "🛒 STEP 1: Running Amazon FMCG Search Spider..."
 echo "------------------------------------------------------------------------"
-python3 scrapers/amazon_spider.py --pages 10
+python3 -m scrapers.amazon_spider --pages 10
 
 # ------------------------------------------------------------------------------
 # STEP 2: Run PDP Spider (New ASINs + 7-Day Rolling Re-scrape)
@@ -56,7 +59,7 @@ echo ""
 echo "------------------------------------------------------------------------"
 echo "🔍 STEP 2: Running Amazon PDP Spider (Spec Deep-Dive)..."
 echo "------------------------------------------------------------------------"
-python3 scrapers/amazon_pdp_spider.py --mode spec --limit 100 --max-age-days 7
+python3 -m scrapers.amazon_pdp_spider --mode spec --limit 2000 --max-age-days 7
 
 # ------------------------------------------------------------------------------
 # STEP 3: Sync Raw Data to Databricks Unity Catalog Volume
@@ -65,7 +68,7 @@ echo ""
 echo "------------------------------------------------------------------------"
 echo "☁️ STEP 3: Uploading Daily Scraped Data to Databricks Volume..."
 echo "------------------------------------------------------------------------"
-python3 scripts/upload_to_volume.py
+python3 -m scripts.upload_to_volume
 
 END_TIME=$(date +%s)
 TOTAL_DURATION=$((END_TIME - START_TIME))

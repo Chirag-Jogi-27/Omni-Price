@@ -85,21 +85,30 @@ class CatalogTracker:
             conn.commit()
         logger.info(f"Registered/Refreshed {len(records)} ASINs from source='{source}'.")
 
-    def get_unscraped_pdp_asins(self, limit: int = None) -> list[dict]:
+    def get_unscraped_pdp_asins(self, max_pdp_age_days: int = 7, limit: int = None) -> list[dict]:
         """
-        Returns ASINs that have NEVER had their full PDP specs scraped.
-        Used by the Full PDP Spec Spider.
+        Returns ASINs needing full PDP specification scraping:
+        1. Newly discovered ASINs that have NEVER had their PDP specs scraped (last_pdp_scraped_at IS NULL).
+        2. Existing active ASINs whose PDP specs are older than max_pdp_age_days (rolling refresh to catch shrinkflation).
+        Ordered so brand new ASINs are crawled first, followed by oldest PDP specs.
         """
         query = """
             SELECT asin, search_category, leaf_node_id 
             FROM catalog_asin 
-            WHERE last_pdp_scraped_at IS NULL AND is_active = 1
+            WHERE is_active = 1 
+              AND (
+                  last_pdp_scraped_at IS NULL 
+                  OR (strftime('%s', 'now') - strftime('%s', last_pdp_scraped_at)) > ? * 86400
+              )
+            ORDER BY 
+              CASE WHEN last_pdp_scraped_at IS NULL THEN 0 ELSE 1 END ASC,
+              last_pdp_scraped_at ASC
         """
         if limit:
             query += f" LIMIT {int(limit)}"
         with self._get_connection() as conn:
             cursor = conn.cursor()
-            cursor.execute(query)
+            cursor.execute(query, (max_pdp_age_days,))
             rows = cursor.fetchall()
             return [{"asin": r[0], "search_category": r[1], "leaf_node_id": r[2]} for r in rows]
 

@@ -43,3 +43,10 @@ databricks/
 # Docs - keep for local reference only, not pushed (optional, remove line if you want docs in git)
 docs/
 *.ipynb_checkpoints/
+
+
+
+omniprice_dbt/profiles.yml
+omniprice_dbt/target/
+omniprice_dbt/dbt_packages/
+omniprice_dbt/logs/

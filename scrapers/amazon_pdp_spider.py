@@ -295,6 +295,7 @@ if __name__ == "__main__":
     parser.add_argument("--mode", choices=["spec", "monitor"], default="spec",
                         help="'spec' for new product specs; 'monitor' for existing product price/stock refresh")
     parser.add_argument("--limit", type=int, default=None, help="Limit number of ASINs to scrape")
+    parser.add_argument("--max-age-days", type=int, default=7, help="Max age in days before re-scraping PDP specs (default: 7)")
     parser.add_argument("--test", action="store_true", help="Run in test mode on sample diverse ASINs")
     args = parser.parse_args()
 
@@ -310,11 +311,11 @@ if __name__ == "__main__":
         products_to_scrape = sample_asins
         logger.info(f"Running TEST MODE on {len(products_to_scrape)} sample ASINs.")
     elif args.mode == "spec":
-        products_to_scrape = tracker.get_unscraped_pdp_asins(limit=args.limit)
-        logger.info(f"Loaded {len(products_to_scrape)} UNSCRAPED ASINs for full spec deep-dive.")
+        products_to_scrape = tracker.get_unscraped_pdp_asins(max_pdp_age_days=args.max_age_days, limit=args.limit)
+        logger.info(f"Loaded {len(products_to_scrape)} ASINs for full spec deep-dive (new + rolling > {args.max_age_days}d).")
         if not products_to_scrape:
             # Fallback if catalog is completely up to date
-            logger.info("All catalog ASINs have full PDP specs. Checking for stale items...")
+            logger.info("All catalog ASINs have fresh PDP specs. Checking for stale price items...")
             products_to_scrape = tracker.get_asins_due_for_monitoring(max_age_hours=24, limit=args.limit or 20)
     else:  # monitor mode
         products_to_scrape = tracker.get_asins_due_for_monitoring(max_age_hours=24, limit=args.limit)

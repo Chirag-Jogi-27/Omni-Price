@@ -1,0 +1,16 @@
+version: 2
+
+sources:
+  - name: silver
+    database: omniprice
+    schema: silver
+    description: Clean Silver layer from notebook 02_amazon_silver_v2
+    tables:
+      - name: amazon_search_observation
+        description: Daily search shelf 378 rows, grain asin+search_category+snapshot_date
+      - name: amazon_product_snapshot
+        description: Daily PDP snapshot 120 rows, grain asin+snapshot_date
+      - name: amazon_price_observation
+        description: Unified price 456 rows, grain asin+snapshot_date, pdp priority
+      - name: amazon_product_history
+        description: SCD2 history 120 rows, grain asin+spec_hash+valid_from

@@ -23,16 +23,16 @@ clean-targets:         # directories to be removed by `dbt clean`
   - "dbt_packages"
 
 
-# Configuring models
-# Full documentation: https://docs.getdbt.com/docs/configuring-models
+on-run-start:
+  - "USE CATALOG omniprice;"
 
-# In this example config, we tell dbt to build all models in the example/
-# directory as views. These settings can be overridden in the individual model
-# files using the `{{ config(...) }}` macro.
+# Configuring models
 models:
   omniprice_dbt:
+    +catalog: omniprice
     marts:
       gold:
+        +schema: gold
         +materialized: incremental
         +incremental_strategy: merge
         +file_format: delta

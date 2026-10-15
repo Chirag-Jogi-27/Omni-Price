@@ -1,0 +1,67 @@
+{
+  "amazon_in": [
+    {
+      "vertical_category": "Grocery & Gourmet Foods",
+      "department_index": "grocery",
+      "subcategory": "Snacks & Sweets",
+      "micro_category": "Chips & Crisps",
+      "url": "https://www.amazon.in/s?i=grocery&k=chips"
+    },
+    {
+      "vertical_category": "Grocery & Gourmet Foods",
+      "department_index": "grocery",
+      "subcategory": "Snacks & Sweets",
+      "micro_category": "Biscuits & Cookies",
+      "url": "https://www.amazon.in/s?i=grocery&k=biscuits"
+    },
+    {
+      "vertical_category": "Grocery & Gourmet Foods",
+      "department_index": "grocery",
+      "subcategory": "Beverages",
+      "micro_category": "Tea & Coffee",
+      "url": "https://www.amazon.in/s?i=grocery&k=tea"
+    },
+    {
+      "vertical_category": "Grocery & Gourmet Foods",
+      "department_index": "grocery",
+      "subcategory": "Cooking Essentials",
+      "micro_category": "Oils & Ghee",
+      "url": "https://www.amazon.in/s?i=grocery&k=cooking+oil"
+    },
+    {
+      "vertical_category": "Beauty & Personal Care",
+      "department_index": "beauty",
+      "subcategory": "Hair Care",
+      "micro_category": "Shampoos",
+      "url": "https://www.amazon.in/s?i=beauty&k=shampoo"
+    },
+    {
+      "vertical_category": "Beauty & Personal Care",
+      "department_index": "beauty",
+      "subcategory": "Bath & Shower",
+      "micro_category": "Soaps & Body Wash",
+      "url": "https://www.amazon.in/s?i=beauty&k=soap"
+    },
+    {
+      "vertical_category": "Health, Household & Personal Care",
+      "department_index": "hpc",
+      "subcategory": "Oral Care",
+      "micro_category": "Toothpastes",
+      "url": "https://www.amazon.in/s?i=hpc&k=toothpaste"
+    },
+    {
+      "vertical_category": "Health, Household & Personal Care",
+      "department_index": "hpc",
+      "subcategory": "Household Cleaning",
+      "micro_category": "Laundry Detergents",
+      "url": "https://www.amazon.in/s?i=hpc&k=detergent"
+    },
+    {
+      "vertical_category": "Baby Care",
+      "department_index": "baby-products",
+      "subcategory": "Diapering",
+      "micro_category": "Disposable Diapers",
+      "url": "https://www.amazon.in/s?i=baby-products&k=diapers"
+    }
+  ]
+}

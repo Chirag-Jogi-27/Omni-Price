@@ -1,0 +1,45 @@
+# Environment & secrets
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.venv/
+venv/
+ENV/
+env/
+*.egg-info/
+dist/
+build/
+
+# Data lake - raw lakehouse is too large for git
+# Keep targets.json, ignore ingested data
+data_lake/raw/
+data_lake/metadata/*.db
+data_lake/metadata/*.db-*
+logs/
+*.log
+
+# Debug HTML dumps - large, temporary, not for git
+data_lake/debug/
+
+# OS & IDE
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+.kilo/
+
+# Databricks - transformation lives in Databricks Repos, not local
+# databricks/ folder is workspace-only (if re-created)
+databricks/
+
+# Docs - keep for local reference only, not pushed (optional, remove line if you want docs in git)
+docs/
+*.ipynb_checkpoints/

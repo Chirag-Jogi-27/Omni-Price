@@ -3,7 +3,8 @@
     materialized='incremental',
     incremental_strategy='merge',
     unique_key='asin_snapshot_date',
-    file_format='delta'
+    file_format='delta',
+    on_schema_change='append_new_columns'
   )
 }}
 
@@ -16,6 +17,10 @@ with price as (
     discount_pct,
     is_mrp_imputed,
     is_price_gt_mrp,
+    -- NEW: spider v2 diagnostics (NULL for pre-v2 crawls by design)
+    is_price_missing,
+    price_missing_reason,
+    availability_status,
     observation_source,
     rating,
     review_count
@@ -38,6 +43,11 @@ select
   p.discount_pct,
   p.is_mrp_imputed,
   p.is_price_gt_mrp,
+  -- NEW: pass through so analytics can separate dead/unavailable products
+  -- from real prices instead of dropping null-price observations.
+  p.is_price_missing,
+  p.price_missing_reason,
+  p.availability_status,
   p.observation_source,
   p.rating,
   p.review_count,

@@ -24,7 +24,16 @@ models:
           - not_null
 
       - name: price
-        description: Current selling price in INR. Null when product is out-of-stock.
+        description: Current selling price in INR. Null when the product is unavailable or price extraction failed — check is_price_missing before aggregating.
+
+      - name: is_price_missing
+        description: True when no price was captured for this observation (product unavailable or price extraction failed). Filter on this flag for price analytics; keep the rows for availability analytics.
+
+      - name: price_missing_reason
+        description: Spider v2 diagnostic — currently_unavailable | no_price_section | selector_miss. Null when a price was captured, and for pre-v2 crawls (before the spider v2 deploy).
+
+      - name: availability_status
+        description: Spider v2 availability enum — in_stock | currently_unavailable | other | unknown. Null for pre-v2 crawls (before the spider v2 deploy).
 
       - name: is_price_gt_mrp
         description: Data quality anomaly flag indicating if selling price exceeds MRP.

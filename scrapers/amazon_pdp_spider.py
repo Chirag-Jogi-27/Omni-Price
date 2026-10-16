@@ -1,6 +1,7 @@
 import json
 import re
 import argparse
+from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 import pandas as pd
@@ -16,11 +17,63 @@ from core.timer import timed_step
 
 logger = get_logger("amazon_pdp_spider")
 
+# ---------------------------------------------------------------------------
+# Canonical taxonomy (mirrors targets.json). Historical catalog-tracker seeds
+# used ad-hoc codes (fmcg_chips, fmcg_shampoo, fmcg_toothpaste, ...) which is
+# why amazon_product_snapshot contained BOTH naming schemes and downstream
+# category analytics were at risk of splitting (e.g. 'fmcg_chips' vs
+# 'Chips & Crisps'). Normalize at the source so search + PDP emit identical
+# category labels.
+# ---------------------------------------------------------------------------
+CANONICAL_CATEGORIES = {
+    "Chips & Crisps", "Biscuits & Cookies", "Tea & Coffee", "Oils & Ghee",
+    "Shampoos", "Soaps & Body Wash", "Toothpastes", "Laundry Detergents",
+    "Disposable Diapers",
+}
+
+LEGACY_CATEGORY_ALIASES = {
+    "fmcg_chips": "Chips & Crisps",
+    "fmcg_biscuits": "Biscuits & Cookies",
+    "fmcg_cookies": "Biscuits & Cookies",
+    "fmcg_tea": "Tea & Coffee",
+    "fmcg_coffee": "Tea & Coffee",
+    "fmcg_oil": "Oils & Ghee",
+    "fmcg_oils": "Oils & Ghee",
+    "fmcg_ghee": "Oils & Ghee",
+    "fmcg_shampoo": "Shampoos",
+    "fmcg_soap": "Soaps & Body Wash",
+    "fmcg_toothpaste": "Toothpastes",
+    "fmcg_detergent": "Laundry Detergents",
+    "fmcg_detergents": "Laundry Detergents",
+    "fmcg_diapers": "Disposable Diapers",
+    "fmcg_diaper": "Disposable Diapers",
+}
+
+
+def normalize_category(raw):
+    """Map legacy seed category codes to the canonical targets.json taxonomy.
+    Unknown labels pass through unchanged (visible in data, never silently
+    remapped)."""
+    if not raw:
+        return "unknown"
+    c = str(raw).strip()
+    if c in CANONICAL_CATEGORIES:
+        return c
+    low = c.lower()
+    if low in LEGACY_CATEGORY_ALIASES:
+        return LEGACY_CATEGORY_ALIASES[low]
+    # case-insensitive canonical match (e.g. 'shampoos' -> 'Shampoos')
+    for canon in CANONICAL_CATEGORIES:
+        if canon.lower() == low:
+            return canon
+    return c
+
+
 class AmazonPDP_Spider(Spider):
     name = "amazon_pdp_spider"
-    # High-throughput Fetcher optimized for 2000 ASIN scale (night-time speed)
-    concurrent_requests = 5
-    download_delay = 0.2
+    # Calibrated for stable high-yield residential scraping (avoids Amazon robot check)
+    concurrent_requests = 3
+    download_delay = 0.5
 
     def configure_sessions(self, manager):
         manager.add(
@@ -54,7 +107,7 @@ class AmazonPDP_Spider(Spider):
                 callback=self.parse,
                 meta={
                     "asin": asin,
-                    "search_category": prod.get('search_category', 'unknown'),
+                    "search_category": normalize_category(prod.get('search_category')),
                     "leaf_node_id": prod.get('leaf_node_id', '')
                 }
             )
@@ -120,9 +173,22 @@ class AmazonPDP_Spider(Spider):
 
         # ----------------------------------------------------------------------
         # 2. Availability & Seller (Buy Box)
+        #    FIX (2026-10-16 analysis): 1,540/8,910 PDP rows (17.3%) had NO
+        #    price AND NO availability text — the single selector
+        #    '#availability span::text' misses unavailable / no-offer pages
+        #    where Amazon renders status outside a span, inside #outOfStock
+        #    alerts, or in alternate buybox containers. Multi-selector here;
+        #    normalized availability_status is derived after price resolution.
         # ----------------------------------------------------------------------
-        availability = response.css('#availability span::text').get()
+        availability = (
+            response.css('#availability span::text').get()
+            or response.css('#availability::text').get()
+            or response.css('div[id*="availability"] span::text').get()
+            or response.css('#outOfStock .a-alert-content::text').get()
+            or response.css('.a-box-error .a-alert-content::text').get()
+        )
         availability = " ".join(availability.split()) if availability else None
+
         seller = (
             response.css('#merchant-info a span::text').get()
             or response.css('#merchantInfoFeature_feature_div span.a-size-small a::text').get()
@@ -156,6 +222,78 @@ class AmazonPDP_Spider(Spider):
             whole = response.css('#corePriceDisplay_desktop_feature_div span.a-price-whole::text').get() or response.css('.priceToPay span.a-price-whole::text').get()
             if whole:
                 price = f"₹{whole.strip().replace('.', '')}"
+
+        # ------------------------------------------------------------------
+        # FIX (2026-10-16): price-miss diagnostics + single automatic retry.
+        # Previously a price-miss row was stored with zero explanation, so
+        # Silver could not distinguish 'product genuinely unavailable' from
+        # 'page variant / selector miss' from 'transient soft-block'. Now:
+        #   - availability_status: in_stock | currently_unavailable | other | unknown
+        #   - price_missing_reason: currently_unavailable | no_price_section |
+        #       selector_miss (None when a price was captured)
+        #   - price_block_snippet: raw HTML of the price area, kept ONLY for
+        #       unexplained misses (truncated) so failures can be classified
+        #       without a manual browser visit.
+        # Unexplained misses get exactly ONE fresh retry before the record is
+        # accepted as final; deterministic 'currently_unavailable' is not
+        # retried.
+        # ------------------------------------------------------------------
+        if availability:
+            avail_low = availability.lower()
+            if "unavailable" in avail_low:
+                availability_status = "currently_unavailable"
+            elif any(t in avail_low for t in ("in stock", "only", "left in", "order soon")):
+                availability_status = "in_stock"
+            else:
+                availability_status = "other"
+        elif price:
+            availability_status = "in_stock"  # live buy box implies stock
+        else:
+            availability_status = "unknown"
+
+        price_el_present = bool(
+            response.css(
+                '#corePriceDisplay_desktop_feature_div, #corePrice_desktop, '
+                '#apex_desktop, .priceToPay, #priceblock_ourprice, #priceblock_dealprice'
+            ).get()
+        )
+
+        if price:
+            price_missing_reason = None
+            price_block_snippet = None
+        elif availability_status == "currently_unavailable":
+            price_missing_reason = "currently_unavailable"
+            price_block_snippet = None  # cause is known; no snippet needed
+        elif not price_el_present:
+            price_missing_reason = "no_price_section"
+            price_block_snippet = (response.css('#buybox, #corePriceDisplay_desktop_feature_div').get() or "")[:400] or None
+        else:
+            price_missing_reason = "selector_miss"
+            price_block_snippet = (response.css('#corePriceDisplay_desktop_feature_div, #apex_desktop, .priceToPay').get() or "")[:400] or None
+
+        # Single automatic retry for unexplained price misses (fresh fetch,
+        # handles transient soft-blocks / partial renders). Attempt 2 is final.
+        if (
+            not price
+            and price_missing_reason in ("no_price_section", "selector_miss")
+            and response.meta.get("retry_attempt", 0) < 1
+        ):
+            logger.warning(
+                "PDP price missing for ASIN=%s (reason=%s, status=%s) — retrying once (attempt 2)",
+                asin, price_missing_reason, availability_status,
+            )
+            yield Request(
+                response.url,
+                sid="fast_http",
+                callback=self.parse,
+                meta={
+                    "asin": asin,
+                    "search_category": category,
+                    "leaf_node_id": leaf_node_id,
+                    "retry_attempt": 1,
+                },
+            )
+            return
 
         # Discover sibling variation ASINs on this page
         available_variations = []
@@ -342,6 +480,9 @@ class AmazonPDP_Spider(Spider):
             "pack_count": effective_pack,
             "available_variations": available_variations,
             "availability": availability,
+            "availability_status": availability_status,
+            "price_missing_reason": price_missing_reason,
+            "price_block_snippet": price_block_snippet,
             "seller": seller,
             "main_image": main_image,
             "bullet_points": bullets,
@@ -369,10 +510,11 @@ if __name__ == "__main__":
     logger.info(f"Starting PDP Spider in mode='{args.mode}' (Catalog size: {tracker.count():,} ASINs)...")
 
     if args.test:
+        # FIX: use canonical targets.json taxonomy in test samples too
         sample_asins = [
-            {"asin": "B08JDK9JL7", "search_category": "fmcg_shampoo", "leaf_node_id": "1374411031"}, # Park Avenue Shampoo
-            {"asin": "B015MXZOP0", "search_category": "fmcg_shampoo", "leaf_node_id": "1374411031"}, # Head & Shoulders
-            {"asin": "B0BN6F4J51", "search_category": "fmcg_chips", "leaf_node_id": "4860045031"}    # Pringles
+            {"asin": "B08JDK9JL7", "search_category": "Shampoos", "leaf_node_id": "1374411031"},  # Park Avenue Shampoo
+            {"asin": "B015MXZOP0", "search_category": "Shampoos", "leaf_node_id": "1374411031"},  # Head & Shoulders
+            {"asin": "B0BN6F4J51", "search_category": "Chips & Crisps", "leaf_node_id": "4860045031"}  # Pringles
         ]
         products_to_scrape = sample_asins
         logger.info(f"Running TEST MODE on {len(products_to_scrape)} sample ASINs.")
@@ -399,6 +541,17 @@ if __name__ == "__main__":
             items_count = len(result.items)
             rate = items_count / t_elapsed if t_elapsed > 0 else 0
             logger.info(f"⏱️ [PERF SUMMARY] Crawled {items_count} PDP records in {t_elapsed:.2f}s ({rate:.1f} items/sec).")
+
+            # Ops visibility: price-miss breakdown by machine-readable reason
+            # (feeds the Silver is_price_missing / availability logic).
+            missed = [it for it in result.items if not it.get("raw_price")]
+            if missed:
+                reasons = Counter(it.get("price_missing_reason") or "unknown" for it in missed)
+                logger.warning(
+                    f"PDP price-miss summary: {dict(reasons)} — {len(missed)}/{items_count} ASINs "
+                    f"({100 * len(missed) / items_count:.1f}%)"
+                )
+
             output_file = spider.raw_run.run_dir / f"pdp_{spider.raw_run.run_id}.jsonl"
             result.items.to_jsonl(str(output_file))
             manifest_file = finalize_raw_run(

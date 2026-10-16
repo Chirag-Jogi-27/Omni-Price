@@ -7,7 +7,7 @@ from pathlib import Path
 import pandas as pd
 
 from scrapling.spiders import Spider, Request, Response
-from scrapling.fetchers import FetcherSession
+from scrapling.fetchers import AsyncStealthySession
 
 import time
 from core.logger import get_logger
@@ -71,20 +71,23 @@ def normalize_category(raw):
 
 class AmazonPDP_Spider(Spider):
     name = "amazon_pdp_spider"
-    # Calibrated for stable high-yield residential scraping (avoids Amazon robot check)
-    concurrent_requests = 3
-    download_delay = 0.5
+    # Hardened settings to bypass Akamai Bot Manager & IP rate-limits
+    concurrent_requests = 1
+    download_delay = 2.0
 
     def configure_sessions(self, manager):
+        profile_dir = Path("data_lake/metadata/browser_profile")
+        profile_dir.mkdir(parents=True, exist_ok=True)
         manager.add(
-            "fast_http",
-            FetcherSession(
-                impersonate="chrome",
-                stealthy_headers=True,
-                proxy=None,
-                timeout=15,
-                retries=2,
-                retry_delay=1,
+            "stealth_browser",
+            AsyncStealthySession(
+                headless=True,
+                disable_resources=True,
+                block_webrtc=True,
+                hide_canvas=True,
+                load_dom=True,
+                user_data_dir=str(profile_dir.resolve()),
+                timeout=30000,
             ),
             lazy=True,
         )
@@ -103,7 +106,7 @@ class AmazonPDP_Spider(Spider):
             url = f"https://www.amazon.in/dp/{asin}"
             yield Request(
                 url,
-                sid="fast_http",
+                sid="stealth_browser",
                 callback=self.parse,
                 meta={
                     "asin": asin,
@@ -284,7 +287,7 @@ class AmazonPDP_Spider(Spider):
             )
             yield Request(
                 response.url,
-                sid="fast_http",
+                sid="stealth_browser",
                 callback=self.parse,
                 meta={
                     "asin": asin,

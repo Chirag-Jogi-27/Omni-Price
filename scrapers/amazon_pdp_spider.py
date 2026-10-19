@@ -7,7 +7,7 @@ from pathlib import Path
 import pandas as pd
 
 from scrapling.spiders import Spider, Request, Response
-from scrapling.fetchers import AsyncStealthySession
+from scrapling.fetchers import FetcherSession
 
 import time
 from core.logger import get_logger
@@ -71,23 +71,19 @@ def normalize_category(raw):
 
 class AmazonPDP_Spider(Spider):
     name = "amazon_pdp_spider"
-    # Hardened settings to bypass Akamai Bot Manager & IP rate-limits
-    concurrent_requests = 1
-    download_delay = 2.0
+    concurrent_requests = 3
+    download_delay = 0.5
 
     def configure_sessions(self, manager):
-        profile_dir = Path("data_lake/metadata/browser_profile")
-        profile_dir.mkdir(parents=True, exist_ok=True)
         manager.add(
-            "stealth_browser",
-            AsyncStealthySession(
-                headless=True,
-                disable_resources=True,
-                block_webrtc=True,
-                hide_canvas=True,
-                load_dom=True,
-                user_data_dir=str(profile_dir.resolve()),
-                timeout=30000,
+            "fast_http",
+            FetcherSession(
+                impersonate="chrome",
+                stealthy_headers=True,
+                proxy=None,
+                timeout=15,
+                retries=2,
+                retry_delay=1,
             ),
             lazy=True,
         )
@@ -106,7 +102,7 @@ class AmazonPDP_Spider(Spider):
             url = f"https://www.amazon.in/dp/{asin}"
             yield Request(
                 url,
-                sid="stealth_browser",
+                sid="fast_http",
                 callback=self.parse,
                 meta={
                     "asin": asin,
@@ -120,6 +116,15 @@ class AmazonPDP_Spider(Spider):
         asin = response.meta.get("asin")
         category = response.meta.get("search_category")
         leaf_node_id = response.meta.get("leaf_node_id")
+
+        # Check if Amazon returned a 404 Page Not Found (Deleted / Delisted ASIN)
+        if response.status == 404:
+            logger.warning(
+                "Product removed from Amazon (404 Page Not Found) for ASIN=%s. Deactivating from queue.",
+                asin,
+            )
+            self.tracker.deactivate_asin(asin)
+            return
 
         # A challenge/blocked response can still produce an HTTP response, so
         # Scrapling would otherwise emit a misleading all-null PDP record.
@@ -287,7 +292,7 @@ class AmazonPDP_Spider(Spider):
             )
             yield Request(
                 response.url,
-                sid="stealth_browser",
+                sid="fast_http",
                 callback=self.parse,
                 meta={
                     "asin": asin,

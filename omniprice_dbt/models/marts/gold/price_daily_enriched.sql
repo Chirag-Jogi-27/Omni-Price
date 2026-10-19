@@ -26,7 +26,7 @@ with price as (
     review_count
   from {{ source('silver', 'amazon_price_observation') }}
   {% if is_incremental() %}
-  where snapshot_date > (select coalesce(max(snapshot_date), '1900-01-01') from {{ this }})
+  where snapshot_date >= (select date_sub(coalesce(max(snapshot_date), '1900-01-01'), 3) from {{ this }})
   {% endif %}
 ),
 

@@ -5,7 +5,7 @@ from pathlib import Path
 from urllib.parse import urljoin
 
 from scrapling.spiders import Spider, Request, Response
-from scrapling.fetchers import AsyncStealthySession
+from scrapling.fetchers import FetcherSession
 import time
 
 from core.logger import get_logger
@@ -43,23 +43,19 @@ def _first(item, *selectors):
 
 class AmazonOPI_Spider(Spider):
     name = "amazon_bronze_spider"
-    # Hardened settings to bypass Akamai Bot Manager & IP rate-limits
-    concurrent_requests = 1
-    download_delay = 2.0
+    concurrent_requests = 2
+    download_delay = 0.6
 
     def configure_sessions(self, manager):
-        profile_dir = Path("data_lake/metadata/browser_profile")
-        profile_dir.mkdir(parents=True, exist_ok=True)
         manager.add(
-            "stealth_browser",
-            AsyncStealthySession(
-                headless=True,
-                disable_resources=True,
-                block_webrtc=True,
-                hide_canvas=True,
-                load_dom=True,
-                user_data_dir=str(profile_dir.resolve()),
-                timeout=30000,
+            "fast_http",
+            FetcherSession(
+                impersonate="chrome",
+                stealthy_headers=True,
+                proxy=None,
+                timeout=15,
+                retries=2,
+                retry_delay=1
             ),
             lazy=True
         )
@@ -83,7 +79,7 @@ class AmazonOPI_Spider(Spider):
             logger.info(f"Queuing Leaf Node Shelf: [{vertical_category} > {subcategory} > {micro_category}] (node={leaf_node_id}) -> {url}")
             yield Request(
                 url,
-                sid="stealth_browser",
+                sid="fast_http",
                 callback=self.parse,
                 meta={
                     "vertical_category": vertical_category,
@@ -279,7 +275,7 @@ class AmazonOPI_Spider(Spider):
                 logger.info(f"Pagination: Moving to page {current_page + 1} for {micro_category}")
                 yield Request(
                     urljoin(BASE_URL, next_page_link),
-                    sid="stealth_browser",
+                    sid="fast_http",
                     callback=self.parse,
                     meta={
                         "vertical_category": vertical_category,

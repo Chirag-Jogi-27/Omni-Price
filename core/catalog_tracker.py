@@ -214,12 +214,12 @@ class CatalogTracker:
               )
             ORDER BY 
               CASE 
-                  WHEN last_pdp_scraped_at IS NULL THEN 1
-                  WHEN is_shelf_anomaly = 1 THEN 2
+                  WHEN is_shelf_anomaly = 1 THEN 1
+                  WHEN last_pdp_scraped_at IS NULL THEN 2
                   WHEN velocity_tier = 1 THEN 3
                   ELSE 4
               END ASC,
-              last_pdp_scraped_at ASC
+              last_price_checked_at DESC
         """
         if limit:
             query += f" LIMIT {int(limit)}"
@@ -278,6 +278,15 @@ class CatalogTracker:
                 SET last_price_checked_at = ?
                 WHERE asin = ?
             """, records)
+            conn.commit()
+
+    def deactivate_asin(self, asin: str):
+        """Marks a dead ASIN (e.g. 404 Page Not Found) as inactive so it stops clogging the queue."""
+        if not asin:
+            return
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("UPDATE catalog_asin SET is_active = 0 WHERE asin = ?", (asin.strip().upper(),))
             conn.commit()
 
     # --------------------------------------------------------------------------

@@ -39,6 +39,14 @@ models:
         description: Data quality anomaly flag indicating if selling price exceeds MRP.
         tests:
           - not_null
+      - name: product_title
+        description: Product title from history, falling back to the latest search-observation title.
+
+      - name: brand
+        description: Brand from product history, falling back to the price-observation brand (never null after fallback).
+        tests:
+          - not_null    
+          
 
   - name: category_daily
     description: >
@@ -59,6 +67,11 @@ models:
 
       - name: product_count
         description: Number of active products observed in this category on this date.
+        tests:
+          - not_null
+
+      - name: sponsored_share
+        description: Share of search rows that were sponsored (0 to 1).
         tests:
           - not_null
 
@@ -88,3 +101,22 @@ models:
         description: Date when the specification reduction was first detected.
         tests:
           - not_null
+
+      - name: is_confirmed_shrinkflation
+        description: >
+          True only when the unit price held or rose after the quantity drop
+          (price-anchored confirmation). False when the unit price fell, or
+          when a pre/post 7-day price window could not be established.
+        tests:
+          - not_null
+          - accepted_values:
+              values: [true, false]
+
+      - name: old_unit_price
+        description: Pre-change 7-day average unit price. Null when no pre-change price exists.
+
+      - name: new_unit_price
+        description: Post-change 7-day average unit price. Null when no post-change price exists.
+
+      - name: unit_price_surge_pct
+        description: Percentage change in unit price across the shrink event.

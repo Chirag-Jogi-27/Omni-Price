@@ -34,6 +34,26 @@ history as (
   select * from {{ source('silver', 'amazon_product_history') }}
 ),
 
+best_category as (
+  select asin, search_category
+  from (
+    select asin, search_category,
+           row_number() over (
+             partition by asin
+             order by cnt desc, max_date desc
+           ) as rn
+    from (
+      select asin, search_category,
+             count(*) as cnt,
+             max(snapshot_date) as max_date
+      from {{ source('silver', 'amazon_search_observation') }}
+      where search_category is not null
+      group by asin, search_category
+    ) freq
+  ) ranked
+  where rn = 1
+),
+
 search_title as (
   select asin, title
   from (
@@ -62,6 +82,7 @@ select
   p.review_count,
   coalesce(h.title, st.title) as product_title,
   coalesce(h.brand, p.price_brand) as brand,
+  coalesce(bc.search_category, 'PDP Only') as search_category,
   h.total_quantity,
   h.quantity_unit,
   h.quantity_source,
@@ -83,5 +104,7 @@ left join history h
   on h.asin = p.asin
  and p.snapshot_date >= h.valid_from
  and (p.snapshot_date <= h.valid_to or h.valid_to = '9999-12-31')
+left join best_category bc
+  on bc.asin = p.asin
 left join search_title st
   on st.asin = p.asin

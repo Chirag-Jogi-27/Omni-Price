@@ -66,6 +66,26 @@ post_prices as (
    and p.snapshot_date >= qd.valid_from
    and p.snapshot_date <= date_add(qd.valid_from, 7)
   group by qd.asin, qd.valid_from
+),
+
+best_category as (
+  select asin, search_category
+  from (
+    select asin, search_category,
+           row_number() over (
+             partition by asin
+             order by cnt desc, max_date desc
+           ) as rn
+    from (
+      select asin, search_category,
+             count(*) as cnt,
+             max(snapshot_date) as max_date
+      from {{ source('silver', 'amazon_search_observation') }}
+      where search_category is not null
+      group by asin, search_category
+    ) freq
+  ) ranked
+  where rn = 1
 )
 
 select
@@ -73,6 +93,7 @@ select
   qd.asin,
   qd.brand,
   qd.product_title,
+  coalesce(bc.search_category, 'Unknown') as search_category,
   qd.quantity_unit,
   qd.prev_qty as old_quantity,
   qd.total_quantity as new_quantity,
@@ -102,3 +123,5 @@ left join pre_prices pre
   on pre.asin = qd.asin and pre.valid_from = qd.valid_from
 left join post_prices post
   on post.asin = qd.asin and post.valid_from = qd.valid_from
+left join best_category bc
+  on bc.asin = qd.asin

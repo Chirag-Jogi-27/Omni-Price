@@ -6,8 +6,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 import pandas as pd
 
+import os
 from scrapling.spiders import Spider, Request, Response
-from scrapling.fetchers import FetcherSession
+from scrapling.fetchers import AsyncStealthySession
 
 import time
 from core.logger import get_logger
@@ -71,20 +72,22 @@ def normalize_category(raw):
 
 class AmazonPDP_Spider(Spider):
     name = "amazon_pdp_spider"
-    concurrent_requests = 3
-    download_delay = 0.5
+    concurrent_requests = 2
+    download_delay = 1.0
 
     def configure_sessions(self, manager):
         manager.add(
-            "fast_http",
-            FetcherSession(
-                impersonate="chrome",
-                stealthy_headers=True,
-                proxy=None,
-                timeout=15,
-                retries=2,
-                retry_delay=1,
+            "async_stealth",
+            AsyncStealthySession(
+                headless=True,
+                disable_resources=True,
+                hide_canvas=True,
+                allow_webgl=True,
+                google_search=True,
+                timeout=30000,
+                proxy=os.getenv("SCRAPER_PROXY") or None,
             ),
+            default=True,
             lazy=True,
         )
 
@@ -102,7 +105,7 @@ class AmazonPDP_Spider(Spider):
             url = f"https://www.amazon.in/dp/{asin}"
             yield Request(
                 url,
-                sid="fast_http",
+                sid="async_stealth",
                 callback=self.parse,
                 meta={
                     "asin": asin,
@@ -292,7 +295,7 @@ class AmazonPDP_Spider(Spider):
             )
             yield Request(
                 response.url,
-                sid="fast_http",
+                sid="async_stealth",
                 callback=self.parse,
                 meta={
                     "asin": asin,

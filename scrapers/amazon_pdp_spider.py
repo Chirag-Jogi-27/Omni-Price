@@ -8,15 +8,17 @@ import pandas as pd
 
 import os
 from scrapling.spiders import Spider, Request, Response
-from scrapling.fetchers import AsyncStealthySession
+from scrapling.fetchers import FetcherSession
 
 import time
+import logging
 from core.logger import get_logger
 from core.catalog_tracker import CatalogTracker
 from core.raw_storage import create_raw_run, finalize_raw_run
 from core.timer import timed_step
 
 logger = get_logger("amazon_pdp_spider")
+logging.getLogger("scrapling").setLevel(logging.INFO)
 
 # ---------------------------------------------------------------------------
 # Canonical taxonomy (mirrors targets.json). Historical catalog-tracker seeds
@@ -72,31 +74,34 @@ def normalize_category(raw):
 
 class AmazonPDP_Spider(Spider):
     name = "amazon_pdp_spider"
+    logging_level = logging.INFO
     concurrent_requests = 2
-    download_delay = 1.0
+    download_delay = 0.8
 
     def configure_sessions(self, manager):
         manager.add(
-            "async_stealth",
-            AsyncStealthySession(
-                headless=True,
-                disable_resources=True,
-                hide_canvas=True,
-                allow_webgl=True,
-                google_search=True,
-                timeout=30000,
+            "fast_http",
+            FetcherSession(
+                impersonate="chrome",
+                stealthy_headers=True,
                 proxy=os.getenv("SCRAPER_PROXY") or None,
+                timeout=20,
+                retries=2,
+                retry_delay=1,
             ),
             default=True,
             lazy=True,
         )
 
-    def __init__(self, products_data, mode="spec", *args, **kwargs):
+    def __init__(self, products_data, mode="spec", raw_run=None, output_file=None, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.products_data = products_data
         self.mode = mode  # 'spec' (full deep-dive) or 'monitor' (lightweight price/stock check)
-        self.raw_run = create_raw_run(platform="amazon_in", source="pdp")
+        self.raw_run = raw_run or create_raw_run(platform="amazon_in", source="pdp")
         self.tracker = CatalogTracker()
+        self.output_file = output_file or (self.raw_run.run_dir / f"pdp_{self.raw_run.run_id}.jsonl")
+        self.items_written = 0
+        self.missed_price_count = 0
 
     async def start_requests(self):
         logger.info(f"Queuing {len(self.products_data)} PDP targets in mode='{self.mode}'...")
@@ -105,7 +110,7 @@ class AmazonPDP_Spider(Spider):
             url = f"https://www.amazon.in/dp/{asin}"
             yield Request(
                 url,
-                sid="async_stealth",
+                sid="fast_http",
                 callback=self.parse,
                 meta={
                     "asin": asin,
@@ -191,14 +196,17 @@ class AmazonPDP_Spider(Spider):
         #    alerts, or in alternate buybox containers. Multi-selector here;
         #    normalized availability_status is derived after price resolution.
         # ----------------------------------------------------------------------
-        availability = (
-            response.css('#availability span::text').get()
-            or response.css('#availability::text').get()
-            or response.css('div[id*="availability"] span::text').get()
-            or response.css('#outOfStock .a-alert-content::text').get()
-            or response.css('.a-box-error .a-alert-content::text').get()
-        )
-        availability = " ".join(availability.split()) if availability else None
+        # Collect non-empty text strings from availability container, ignoring whitespace and scripts
+        avail_texts = [
+            t.strip()
+            for t in response.css(
+                '#availability span::text, #availability::text, .primary-availability-message::text, '
+                '#outOfStock .a-alert-content::text, .a-box-error .a-alert-content::text, '
+                '#buybox-see-all-buying-choices a::text, #unqualifiedBuyBox_feature_div ::text'
+            ).getall()
+            if t.strip() and not t.strip().startswith(("P.when", "(function", "var ", "window."))
+        ]
+        availability = " ".join(avail_texts) if avail_texts else None
 
         seller = (
             response.css('#merchant-info a span::text').get()
@@ -235,30 +243,31 @@ class AmazonPDP_Spider(Spider):
                 price = f"₹{whole.strip().replace('.', '')}"
 
         # ------------------------------------------------------------------
-        # FIX (2026-10-16): price-miss diagnostics + single automatic retry.
-        # Previously a price-miss row was stored with zero explanation, so
-        # Silver could not distinguish 'product genuinely unavailable' from
-        # 'page variant / selector miss' from 'transient soft-block'. Now:
-        #   - availability_status: in_stock | currently_unavailable | other | unknown
-        #   - price_missing_reason: currently_unavailable | no_price_section |
-        #       selector_miss (None when a price was captured)
+        # Price-miss diagnostics:
+        #   - availability_status: in_stock | currently_unavailable | no_featured_offer | other | unknown
+        #   - price_missing_reason: currently_unavailable | no_featured_offer | no_price_section | selector_miss
         #   - price_block_snippet: raw HTML of the price area, kept ONLY for
-        #       unexplained misses (truncated) so failures can be classified
-        #       without a manual browser visit.
-        # Unexplained misses get exactly ONE fresh retry before the record is
-        # accepted as final; deterministic 'currently_unavailable' is not
-        # retried.
+        #       unexplained misses (truncated) so failures can be classified.
         # ------------------------------------------------------------------
+        has_see_all = bool(response.css('#buybox-see-all-buying-choices, a[href*="offer-listing"], #unqualifiedBuyBox_feature_div').get())
+        is_out_of_stock = bool(response.css('#outOfStock').get())
+
         if availability:
             avail_low = availability.lower()
-            if "unavailable" in avail_low:
+            if "unavailable" in avail_low or is_out_of_stock or "out of stock" in avail_low:
                 availability_status = "currently_unavailable"
             elif any(t in avail_low for t in ("in stock", "only", "left in", "order soon")):
                 availability_status = "in_stock"
+            elif has_see_all or "see all buying options" in avail_low:
+                availability_status = "no_featured_offer"
             else:
                 availability_status = "other"
         elif price:
             availability_status = "in_stock"  # live buy box implies stock
+        elif is_out_of_stock:
+            availability_status = "currently_unavailable"
+        elif has_see_all:
+            availability_status = "no_featured_offer"
         else:
             availability_status = "unknown"
 
@@ -275,6 +284,9 @@ class AmazonPDP_Spider(Spider):
         elif availability_status == "currently_unavailable":
             price_missing_reason = "currently_unavailable"
             price_block_snippet = None  # cause is known; no snippet needed
+        elif availability_status == "no_featured_offer":
+            price_missing_reason = "no_featured_offer"
+            price_block_snippet = None  # standard 3P multi-seller offer listing
         elif not price_el_present:
             price_missing_reason = "no_price_section"
             price_block_snippet = (response.css('#buybox, #corePriceDisplay_desktop_feature_div').get() or "")[:400] or None
@@ -282,8 +294,7 @@ class AmazonPDP_Spider(Spider):
             price_missing_reason = "selector_miss"
             price_block_snippet = (response.css('#corePriceDisplay_desktop_feature_div, #apex_desktop, .priceToPay').get() or "")[:400] or None
 
-        # Single automatic retry for unexplained price misses (fresh fetch,
-        # handles transient soft-blocks / partial renders). Attempt 2 is final.
+        # Single automatic retry for true unexplained price misses
         if (
             not price
             and price_missing_reason in ("no_price_section", "selector_miss")
@@ -295,8 +306,9 @@ class AmazonPDP_Spider(Spider):
             )
             yield Request(
                 response.url,
-                sid="async_stealth",
+                sid="fast_http",
                 callback=self.parse,
+                dont_filter=True,
                 meta={
                     "asin": asin,
                     "search_category": category,
@@ -478,7 +490,7 @@ class AmazonPDP_Spider(Spider):
             if first_word and len(first_word) > 1:
                 brand = first_word
 
-        yield {
+        record = {
             "asin": asin,
             "search_category": category,
             "leaf_node_id": final_leaf_node_id,
@@ -507,12 +519,30 @@ class AmazonPDP_Spider(Spider):
             "source_url": response.url
         }
 
+        # STREAM-WRITE IMMEDIATELY TO DISK (Crash resilience: never hold in RAM only)
+        with open(self.output_file, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        self.items_written += 1
+
+        if not price:
+            self.missed_price_count += 1
+
+        # Mark lifecycle immediately in SQLite
+        if self.mode == "spec":
+            self.tracker.mark_batch_pdp_scraped([asin])
+        else:
+            self.tracker.mark_batch_price_checked([asin])
+
+        # Yield lightweight stub instead of giant record to keep Python engine RAM near 0 MB
+        yield {"asin": asin, "status": "saved"}
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="OmniPrice Enterprise PDP Spider")
     parser.add_argument("--mode", choices=["spec", "monitor"], default="spec",
                         help="'spec' for new product specs; 'monitor' for existing product price/stock refresh")
     parser.add_argument("--limit", type=int, default=None, help="Limit number of ASINs to scrape")
+    parser.add_argument("--batch-size", type=int, default=100, help="Number of ASINs per batch to recycle memory (default: 100)")
     parser.add_argument("--max-age-days", type=int, default=7, help="Max age in days before re-scraping PDP specs (default: 7)")
     parser.add_argument("--test", action="store_true", help="Run in test mode on sample diverse ASINs")
     args = parser.parse_args()
@@ -521,11 +551,10 @@ if __name__ == "__main__":
     logger.info(f"Starting PDP Spider in mode='{args.mode}' (Catalog size: {tracker.count():,} ASINs)...")
 
     if args.test:
-        # FIX: use canonical targets.json taxonomy in test samples too
         sample_asins = [
-            {"asin": "B08JDK9JL7", "search_category": "Shampoos", "leaf_node_id": "1374411031"},  # Park Avenue Shampoo
-            {"asin": "B015MXZOP0", "search_category": "Shampoos", "leaf_node_id": "1374411031"},  # Head & Shoulders
-            {"asin": "B0BN6F4J51", "search_category": "Chips & Crisps", "leaf_node_id": "4860045031"}  # Pringles
+            {"asin": "B08JDK9JL7", "search_category": "Shampoos", "leaf_node_id": "1374411031"},
+            {"asin": "B015MXZOP0", "search_category": "Shampoos", "leaf_node_id": "1374411031"},
+            {"asin": "B0BN6F4J51", "search_category": "Chips & Crisps", "leaf_node_id": "4860045031"}
         ]
         products_to_scrape = sample_asins
         logger.info(f"Running TEST MODE on {len(products_to_scrape)} sample ASINs.")
@@ -533,7 +562,6 @@ if __name__ == "__main__":
         products_to_scrape = tracker.get_unscraped_pdp_asins(limit=args.limit)
         logger.info(f"Loaded {len(products_to_scrape)} ASINs for full spec deep-dive (new + anomalies + tiered rolling).")
         if not products_to_scrape:
-            # Fallback if catalog is completely up to date
             logger.info("All catalog ASINs have fresh PDP specs. Checking for stale price items...")
             products_to_scrape = tracker.get_asins_due_for_monitoring(max_age_hours=24, limit=args.limit or 20)
     else:  # monitor mode
@@ -543,43 +571,66 @@ if __name__ == "__main__":
     if not products_to_scrape:
         logger.info("No ASINs to scrape at this time. Pipeline is up-to-date.")
     else:
+        batch_size = args.batch_size
+        total_asins = len(products_to_scrape)
+        total_batches = (total_asins + batch_size - 1) // batch_size
+        logger.info(
+            f"🚀 Loaded {total_asins} ASINs. Executing in auto-recycled batches of {batch_size} (Zero-RAM mode)..."
+        )
+
+        # Single master raw run and output file for the entire execution
+        raw_run = create_raw_run(platform="amazon_in", source="pdp")
+        output_file = raw_run.run_dir / f"pdp_{raw_run.run_id}.jsonl"
+        total_written = 0
         t_start = time.perf_counter()
-        spider = AmazonPDP_Spider(products_data=products_to_scrape, mode=args.mode)
-        result = spider.start()
-        t_elapsed = time.perf_counter() - t_start
 
-        if result.items:
-            items_count = len(result.items)
-            rate = items_count / t_elapsed if t_elapsed > 0 else 0
-            logger.info(f"⏱️ [PERF SUMMARY] Crawled {items_count} PDP records in {t_elapsed:.2f}s ({rate:.1f} items/sec).")
+        import gc
 
-            # Ops visibility: price-miss breakdown by machine-readable reason
-            # (feeds the Silver is_price_missing / availability logic).
-            missed = [it for it in result.items if not it.get("raw_price")]
-            if missed:
-                reasons = Counter(it.get("price_missing_reason") or "unknown" for it in missed)
-                logger.warning(
-                    f"PDP price-miss summary: {dict(reasons)} — {len(missed)}/{items_count} ASINs "
-                    f"({100 * len(missed) / items_count:.1f}%)"
+        try:
+            for batch_idx in range(0, total_asins, batch_size):
+                chunk = products_to_scrape[batch_idx : batch_idx + batch_size]
+                batch_num = (batch_idx // batch_size) + 1
+
+                logger.info(
+                    f"\n🔄 [BATCH {batch_num}/{total_batches}] Starting HTTP session for {len(chunk)} ASINs..."
                 )
 
-            output_file = spider.raw_run.run_dir / f"pdp_{spider.raw_run.run_id}.jsonl"
-            result.items.to_jsonl(str(output_file))
-            manifest_file = finalize_raw_run(
-                run=spider.raw_run,
-                data_file=output_file,
-                record_count=items_count,
-                scraper_name=spider.name,
-                extra_metadata={"crawl_mode": args.mode},
-            )
-            logger.info(f"Raw PDP data saved to {output_file}; manifest={manifest_file}")
+                spider = AmazonPDP_Spider(
+                    products_data=chunk,
+                    mode=args.mode,
+                    raw_run=raw_run,
+                    output_file=output_file
+                )
 
-            # Update lifecycle state in CatalogTracker
-            scraped_asins = [it.get("asin") for it in result.items if it.get("asin")]
-            if args.mode == "spec":
-                tracker.mark_batch_pdp_scraped(scraped_asins)
+                try:
+                    spider.start()
+                except Exception as e:
+                    logger.error(f"Batch {batch_num} error: {e}", exc_info=True)
+                finally:
+                    total_written += spider.items_written
+                    logger.info(
+                        f"✅ [BATCH {batch_num}/{total_batches}] Done ({spider.items_written} items saved). "
+                        f"Cumulative saved: {total_written}/{total_asins}"
+                    )
+
+                # Force Python and OS garbage collection between batches
+                gc.collect()
+                time.sleep(1.0)
+
+        finally:
+            t_elapsed = time.perf_counter() - t_start
+            if total_written > 0:
+                rate = total_written / t_elapsed if t_elapsed > 0 else 0
+                logger.info(
+                    f"\n🎉 [CRAWL COMPLETED] Safely saved {total_written} PDP records in {t_elapsed:.2f}s ({rate:.1f} items/sec)."
+                )
+                manifest_file = finalize_raw_run(
+                    run=raw_run,
+                    data_file=output_file,
+                    record_count=total_written,
+                    scraper_name="amazon_pdp_spider",
+                    extra_metadata={"crawl_mode": args.mode, "batches": total_batches, "batch_size": batch_size},
+                )
+                logger.info(f"Raw data safely stored: {output_file}; manifest={manifest_file}")
             else:
-                tracker.mark_batch_price_checked(scraped_asins)
-            logger.info(f"Updated CatalogTracker lifecycle for {len(scraped_asins)} ASINs.")
-        else:
-            logger.warning(f"No items returned from PDP spider. (Elapsed: {t_elapsed:.2f}s).")
+                logger.warning(f"No items returned from PDP spider. (Elapsed: {t_elapsed:.2f}s).")

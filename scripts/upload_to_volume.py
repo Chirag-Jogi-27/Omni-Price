@@ -39,11 +39,32 @@ def get_headers():
         "Content-Type": "application/octet-stream"
     }
 
-def upload_file_to_volume(local_path: Path, remote_volume_path: str) -> bool:
-    """Uploads a single file to Databricks Volume via Files API."""
-    url = f"https://{DATABRICKS_HOST}/api/2.0/fs/files{remote_volume_path}"
+def get_remote_file_size(remote_volume_path: str) -> int | None:
+    """Returns remote file size in bytes if it exists, else None."""
+    try:
+        url = f"https://{DATABRICKS_HOST}/api/2.0/fs/files{remote_volume_path}"
+        r = requests.head(url, headers=get_headers(), timeout=10)
+        if r.status_code == 200 and "Content-Length" in r.headers:
+            return int(r.headers["Content-Length"])
+    except Exception:
+        pass
+    return None
+
+def upload_file_to_volume(local_path: Path, remote_volume_path: str, overwrite: bool = True) -> bool:
+    """Uploads a single file to Databricks Volume via Files API with smart deduplication."""
+    local_size = local_path.stat().st_size
+    file_size_mb = local_size / (1024 * 1024)
+
+    # For immutable data files (.jsonl), skip if already synced on Volume with identical size
+    if local_path.name != "manifest.json":
+        remote_size = get_remote_file_size(remote_volume_path)
+        if remote_size is not None and remote_size == local_size:
+            print(f"  ⚡ Skipping: {local_path.name} ({file_size_mb:.2f} MB, already synced on Volume)")
+            return True
+
+    query = "?overwrite=true" if overwrite else ""
+    url = f"https://{DATABRICKS_HOST}/api/2.0/fs/files{remote_volume_path}{query}"
     
-    file_size_mb = local_path.stat().st_size / (1024 * 1024)
     print(f"  -> Uploading: {local_path.name} ({file_size_mb:.2f} MB)...")
     
     with open(local_path, "rb") as f:
@@ -100,6 +121,26 @@ def sync_date_to_volume(target_date: str = None):
     return total_failed == 0
 
 if __name__ == "__main__":
-    date_arg = sys.argv[1] if len(sys.argv) > 1 else None
-    success = sync_date_to_volume(date_arg)
-    sys.exit(0 if success else 1)
+    args = sys.argv[1:]
+    if "--all" in args:
+        local_base = Path("data_lake/raw/platform=amazon_in")
+        found_dates = set()
+        for p in local_base.glob("source=*/ingest_date=*"):
+            found_dates.add(p.name.replace("ingest_date=", ""))
+        dates_to_sync = sorted(list(found_dates))
+        print(f"📦 Found {len(dates_to_sync)} dates locally to sync: {dates_to_sync}")
+        all_success = True
+        for d in dates_to_sync:
+            if not sync_date_to_volume(d):
+                all_success = False
+        sys.exit(0 if all_success else 1)
+    elif len(args) > 1:
+        all_success = True
+        for d in args:
+            if not sync_date_to_volume(d):
+                all_success = False
+        sys.exit(0 if all_success else 1)
+    else:
+        date_arg = args[0] if args else None
+        success = sync_date_to_volume(date_arg)
+        sys.exit(0 if success else 1)

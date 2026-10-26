@@ -1,17 +1,16 @@
 import json
 import re
 import argparse
+import time
+import os
+import gc
+import logging
 from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
-import pandas as pd
-
-import os
 from scrapling.spiders import Spider, Request, Response
 from scrapling.fetchers import FetcherSession
 
-import time
-import logging
 from core.logger import get_logger
 from core.catalog_tracker import CatalogTracker
 from core.raw_storage import create_raw_run, finalize_raw_run
@@ -72,19 +71,74 @@ def normalize_category(raw):
     return c
 
 
+def get_amazon_clearance_cookies(proxy: str = None) -> str:
+    """
+    Performs a 1-second handshake with Amazon to obtain anti-bot clearance cookies
+    (e.g., x-amz-captcha-1, x-amz-captcha-2) so PDP requests aren't intercepted
+    by the 'Click to continue' interstitial challenge.
+    """
+    try:
+        from curl_cffi import requests as cffi_requests
+        s = cffi_requests.Session()
+        proxies = {"http": proxy, "https": proxy} if proxy else None
+        headers = {"referer": "https://www.google.com/"}
+        
+        # Probe endpoint to see if challenge is presented
+        r = s.get(
+            "https://www.amazon.in/errors_page/validateCaptcha",
+            impersonate="chrome120",
+            headers=headers,
+            proxies=proxies,
+            timeout=10,
+        )
+        inputs = dict(re.findall(r'<input\s+type="hidden"\s+name="([^"]+)"\s+value="([^"]*)"', r.text))
+        if not inputs:
+            r = s.get(
+                "https://www.amazon.in/",
+                impersonate="chrome120",
+                headers=headers,
+                proxies=proxies,
+                timeout=10,
+            )
+            inputs = dict(re.findall(r'<input\s+type="hidden"\s+name="([^"]+)"\s+value="([^"]*)"', r.text))
+
+        if inputs:
+            s.get(
+                "https://www.amazon.in/errors_page/validateCaptcha",
+                params=inputs,
+                impersonate="chrome120",
+                proxies=proxies,
+                timeout=10,
+            )
+
+        cookie_str = "; ".join([f"{k}={v}" for k, v in s.cookies.items()])
+        if "amz" in cookie_str or "session" in cookie_str or "ubid" in cookie_str:
+            logger.info("Successfully acquired Amazon clearance session cookies.")
+            return cookie_str
+    except Exception as e:
+        logger.warning(f"Could not acquire Amazon clearance cookies automatically: {e}")
+    return ""
+
+
 class AmazonPDP_Spider(Spider):
     name = "amazon_pdp_spider"
     logging_level = logging.INFO
     concurrent_requests = 2
-    download_delay = 0.8
+    download_delay = 1.0
 
     def configure_sessions(self, manager):
+        proxy = os.getenv("SCRAPER_PROXY") or None
+        headers = {}
+        if getattr(self, "cookie_header", None):
+            headers["Cookie"] = self.cookie_header
+
         manager.add(
             "fast_http",
             FetcherSession(
                 impersonate="chrome",
                 stealthy_headers=True,
-                proxy=os.getenv("SCRAPER_PROXY") or None,
+                headers=headers,
+                proxy=proxy,
                 timeout=20,
                 retries=2,
                 retry_delay=1,
@@ -93,8 +147,17 @@ class AmazonPDP_Spider(Spider):
             lazy=True,
         )
 
-    def __init__(self, products_data, mode="spec", raw_run=None, output_file=None, *args, **kwargs):
-        super().__init__(*args, **kwargs)
+    async def on_close(self):
+        """Clean up session manager and release memory/connections immediately."""
+        try:
+            if hasattr(self, "_session_manager") and self._session_manager:
+                await self._session_manager.close()
+        except Exception:
+            pass
+        self.logger.debug("Spider and sessions closed cleanly.")
+
+    def __init__(self, products_data, mode="spec", raw_run=None, output_file=None, cookie_header=None, *args, **kwargs):
+        self.cookie_header = cookie_header
         self.products_data = products_data
         self.mode = mode  # 'spec' (full deep-dive) or 'monitor' (lightweight price/stock check)
         self.raw_run = raw_run or create_raw_run(platform="amazon_in", source="pdp")
@@ -102,6 +165,7 @@ class AmazonPDP_Spider(Spider):
         self.output_file = output_file or (self.raw_run.run_dir / f"pdp_{self.raw_run.run_id}.jsonl")
         self.items_written = 0
         self.missed_price_count = 0
+        super().__init__(*args, **kwargs)
 
     async def start_requests(self):
         logger.info(f"Queuing {len(self.products_data)} PDP targets in mode='{self.mode}'...")
@@ -157,56 +221,73 @@ class AmazonPDP_Spider(Spider):
             return
 
         # ----------------------------------------------------------------------
+        # ----------------------------------------------------------------------
         # 1. Commercial Pricing (Live selling price, MRP, unit price)
         # ----------------------------------------------------------------------
-        price = (
-            response.css('#corePriceDisplay_desktop_feature_div .a-price:not(.a-text-price) span.a-offscreen::text').get()
-            or response.css('#corePrice_desktop .a-price:not(.a-text-price) span.a-offscreen::text').get()
-            or response.css('#apex_desktop .a-price:not(.a-text-price) span.a-offscreen::text').get()
-            or response.css('.priceToPay span.a-offscreen::text').get()
-            or response.css('.a-price.aok-align-center:not(.a-text-price) span.a-offscreen::text').get()
-            or response.css('#priceblock_ourprice::text').get()
-            or response.css('#priceblock_dealprice::text').get()
-        )
+        price = None
+        for sel in [
+            '#corePriceDisplay_desktop_feature_div .a-price:not(.a-text-price) span.a-offscreen::text',
+            '#corePrice_desktop .a-price:not(.a-text-price) span.a-offscreen::text',
+            '#apex_desktop .a-price:not(.a-text-price) span.a-offscreen::text',
+            '.priceToPay span.a-offscreen::text',
+            '.a-price.aok-align-center:not(.a-text-price) span.a-offscreen::text',
+            '#priceblock_ourprice::text',
+            '#priceblock_dealprice::text',
+        ]:
+            val = response.css(sel).get()
+            if val and val.strip() and val.strip().lower() != "null":
+                price = val.strip()
+                break
 
-        mrp = (
-            response.css('span[data-a-strike="true"] span.a-offscreen::text').get()
-            or response.css('.basisPrice span.a-offscreen::text').get()
-            or response.css('#corePriceDisplay_desktop_feature_div .a-text-price[data-a-strike="true"] span.a-offscreen::text').get()
-            or response.css('#corePriceDisplay_desktop_feature_div span.a-size-small.a-color-secondary span.a-price[data-a-strike="true"] span.a-offscreen::text').get()
-            or response.css('.a-price.a-text-price[data-a-strike="true"] span.a-offscreen::text').get()
-        )
+        mrp = None
+        for sel in [
+            'span[data-a-strike="true"] span.a-offscreen::text',
+            '.basisPrice span.a-offscreen::text',
+            '#corePriceDisplay_desktop_feature_div .a-text-price[data-a-strike="true"] span.a-offscreen::text',
+            '#corePriceDisplay_desktop_feature_div span.a-size-small.a-color-secondary span.a-price[data-a-strike="true"] span.a-offscreen::text',
+            '#apex_desktop .a-price.a-text-price[data-a-strike="true"] span.a-offscreen::text',
+            '.a-price.a-text-price[data-a-strike="true"] span.a-offscreen::text',
+        ]:
+            val = response.css(sel).get()
+            if val and val.strip() and val.strip().lower() != "null":
+                mrp = val.strip()
+                break
 
-        unit_price = (
-            response.css('span.pricePerUnit span.a-price span.a-offscreen::text').get()
-            or response.css('span.pricePerUnit::text').get()
-            or response.css('#corePriceDisplay_desktop_feature_div span.a-size-small.a-color-secondary:contains("/")::text').get()
-        )
-
-        price = price.strip() if price and price.strip().lower() != "null" else None
-        mrp = mrp.strip() if mrp and mrp.strip().lower() != "null" else None
-        unit_price = " ".join(unit_price.split()) if unit_price and unit_price.strip().lower() != "null" else None
+        unit_price = None
+        for sel in [
+            'span.pricePerUnit span.a-price span.a-offscreen::text',
+            'span.pricePerUnit::text',
+            '#corePriceDisplay_desktop_feature_div span.a-size-small.a-color-secondary:contains("/")::text',
+            '#apex_desktop .apex-priceperunit-value span.a-offscreen::text',
+        ]:
+            val = response.css(sel).get()
+            if val and val.strip() and val.strip().lower() != "null":
+                unit_price = " ".join(val.split())
+                break
 
         # ----------------------------------------------------------------------
         # 2. Availability & Seller (Buy Box)
-        #    FIX (2026-10-16 analysis): 1,540/8,910 PDP rows (17.3%) had NO
-        #    price AND NO availability text — the single selector
-        #    '#availability span::text' misses unavailable / no-offer pages
-        #    where Amazon renders status outside a span, inside #outOfStock
-        #    alerts, or in alternate buybox containers. Multi-selector here;
-        #    normalized availability_status is derived after price resolution.
         # ----------------------------------------------------------------------
-        # Collect non-empty text strings from availability container, ignoring whitespace and scripts
-        avail_texts = [
-            t.strip()
-            for t in response.css(
-                '#availability span::text, #availability::text, .primary-availability-message::text, '
-                '#outOfStock .a-alert-content::text, .a-box-error .a-alert-content::text, '
-                '#buybox-see-all-buying-choices a::text, #unqualifiedBuyBox_feature_div ::text'
-            ).getall()
-            if t.strip() and not t.strip().startswith(("P.when", "(function", "var ", "window."))
-        ]
-        availability = " ".join(avail_texts) if avail_texts else None
+        is_out_of_stock = bool(
+            response.css('#outOfStock, .a-box-error').get()
+            or response.css('#availability:contains("Currently unavailable"), #availability:contains("out of stock")').get()
+        )
+        has_see_all = bool(
+            response.css('#buybox-see-all-buying-choices, #unqualifiedBuyBox_feature_div, a[href*="offer-listing"]').get()
+        )
+
+        availability = (
+            response.css('#availability span.primary-availability-message::text').get()
+            or response.css('#availability span::text').get()
+            or response.css('#availability::text').get()
+            or response.css('div[id*="availability"] span::text').get()
+            or response.css('#outOfStock .a-box-inner span::text').get()
+            or response.css('#outOfStock .a-alert-content::text').get()
+        )
+        if availability:
+            availability = " ".join(availability.split())
+            if not availability:
+                availability = None
 
         seller = (
             response.css('#merchant-info a span::text').get()
@@ -231,43 +312,37 @@ class AmazonPDP_Spider(Spider):
         if selected_swatch:
             swatch_price = selected_swatch.css('.slot-price span.a-price:not(.a-text-price) span.a-offscreen::text').get()
             swatch_mrp = selected_swatch.css('span[data-a-strike="true"] span.a-offscreen::text').get()
-            if not price and swatch_price:
+            if not price and swatch_price and swatch_price.strip():
                 price = swatch_price.strip()
-            if not mrp and swatch_mrp:
+            if not mrp and swatch_mrp and swatch_mrp.strip():
                 mrp = swatch_mrp.strip()
 
-        # Fallback to whole price
+        # Fallback to whole price digits if offscreen was blank or whitespace
         if not price:
-            whole = response.css('#corePriceDisplay_desktop_feature_div span.a-price-whole::text').get() or response.css('.priceToPay span.a-price-whole::text').get()
-            if whole:
+            whole = (
+                response.css('#corePriceDisplay_desktop_feature_div span.a-price-whole::text').get()
+                or response.css('.priceToPay span.a-price-whole::text').get()
+                or response.css('#apex_desktop span.a-price-whole::text').get()
+            )
+            if whole and whole.strip():
                 price = f"₹{whole.strip().replace('.', '')}"
 
-        # ------------------------------------------------------------------
-        # Price-miss diagnostics:
-        #   - availability_status: in_stock | currently_unavailable | no_featured_offer | other | unknown
-        #   - price_missing_reason: currently_unavailable | no_featured_offer | no_price_section | selector_miss
-        #   - price_block_snippet: raw HTML of the price area, kept ONLY for
-        #       unexplained misses (truncated) so failures can be classified.
-        # ------------------------------------------------------------------
-        has_see_all = bool(response.css('#buybox-see-all-buying-choices, a[href*="offer-listing"], #unqualifiedBuyBox_feature_div').get())
-        is_out_of_stock = bool(response.css('#outOfStock').get())
-
-        if availability:
+        if price:
+            availability_status = "in_stock"
+        elif is_out_of_stock or (availability and any(t in availability.lower() for t in ("unavailable", "out of stock"))):
+            availability_status = "currently_unavailable"
+            if not availability:
+                availability = "Currently unavailable."
+        elif has_see_all or (availability and "see all buying options" in availability.lower()):
+            availability_status = "no_featured_offer"
+            if not availability:
+                availability = "See All Buying Options"
+        elif availability:
             avail_low = availability.lower()
-            if "unavailable" in avail_low or is_out_of_stock or "out of stock" in avail_low:
-                availability_status = "currently_unavailable"
-            elif any(t in avail_low for t in ("in stock", "only", "left in", "order soon")):
+            if any(t in avail_low for t in ("in stock", "only", "left in", "order soon")):
                 availability_status = "in_stock"
-            elif has_see_all or "see all buying options" in avail_low:
-                availability_status = "no_featured_offer"
             else:
                 availability_status = "other"
-        elif price:
-            availability_status = "in_stock"  # live buy box implies stock
-        elif is_out_of_stock:
-            availability_status = "currently_unavailable"
-        elif has_see_all:
-            availability_status = "no_featured_offer"
         else:
             availability_status = "unknown"
 
@@ -283,10 +358,10 @@ class AmazonPDP_Spider(Spider):
             price_block_snippet = None
         elif availability_status == "currently_unavailable":
             price_missing_reason = "currently_unavailable"
-            price_block_snippet = None  # cause is known; no snippet needed
+            price_block_snippet = None
         elif availability_status == "no_featured_offer":
             price_missing_reason = "no_featured_offer"
-            price_block_snippet = None  # standard 3P multi-seller offer listing
+            price_block_snippet = None
         elif not price_el_present:
             price_missing_reason = "no_price_section"
             price_block_snippet = (response.css('#buybox, #corePriceDisplay_desktop_feature_div').get() or "")[:400] or None
@@ -294,7 +369,7 @@ class AmazonPDP_Spider(Spider):
             price_missing_reason = "selector_miss"
             price_block_snippet = (response.css('#corePriceDisplay_desktop_feature_div, #apex_desktop, .priceToPay').get() or "")[:400] or None
 
-        # Single automatic retry for true unexplained price misses
+        # Single automatic retry for unexplained price misses (fresh fetch)
         if (
             not price
             and price_missing_reason in ("no_price_section", "selector_miss")
@@ -323,6 +398,13 @@ class AmazonPDP_Spider(Spider):
         sibling_asins_to_queue = []
         variation_elements = response.css('li[data-asin], div#tp-inline-twister-dim-values-container li, #variation_size_name li')
         for v in variation_elements:
+            classes = v.attrib.get("class", "")
+            is_disabled = (
+                "swatch-unavailable" in classes
+                or "a-button-unavailable" in classes
+                or v.attrib.get("data-a-strike") == "true"
+                or v.attrib.get("aria-disabled") == "true"
+            )
             v_title = v.css('img::attr(alt)').get() or v.css('span.swatch-title-text-display::text').get() or v.css('span.a-size-base::text').get()
             v_asin = v.attrib.get('data-asin') or v.attrib.get('data-defaultasin')
             v_p = v.css('span.a-price:not(.a-text-price) span.a-offscreen::text').get() or v.css('span.a-price-whole::text').get()
@@ -332,7 +414,8 @@ class AmazonPDP_Spider(Spider):
                 if v_asin:
                     v_asin = v_asin.strip().upper()
                     var_item["asin"] = v_asin
-                    if v_asin != asin:
+                    # Only queue available sibling ASINs to avoid queuing dead/discontinued stock
+                    if v_asin != asin and not is_disabled:
                         sibling_asins_to_queue.append({
                             "asin": v_asin,
                             "search_category": category,
@@ -391,14 +474,8 @@ class AmazonPDP_Spider(Spider):
 
         # ------------------------------------------------------------------
         # 5. Product Details Table — Multi-Layout Extraction
-        #    FIX: Amazon uses 4+ different layouts for product details.
-        #    Previously only checked 2, causing 6.2% of PDP records to have
-        #    an empty product_details_table (→ nulls in Silver for
-        #    manufacturer, country_of_origin, net_quantity, etc.)
         # ------------------------------------------------------------------
         details = {}
-
-        # Try all known Amazon product-detail layouts in priority order
         rows = (
             response.css('#productDetails_techSpec_section_1 tr')
             or response.css('#productDetails_techSpec_section_2 tr')
@@ -414,14 +491,6 @@ class AmazonPDP_Spider(Spider):
                 key = re.sub(r'[\u200f\u200e\s:]+', ' ', key).strip()
                 val = re.sub(r'[\u200f\u200e\s]+', ' ', val).strip()
                 if key and val:
-                    # ------------------------------------------------------------------
-                    # FIX: Normalize inconsistent Amazon key names.
-                    # Amazon uses different labels for the same field across
-                    # layouts and categories, e.g. "Country of Origin" vs
-                    # "Country/Region of origin". Without normalization, the
-                    # Silver notebook can't reliably look up keys → 34.3%
-                    # null for country_of_origin and 8.2% for manufacturer.
-                    # ------------------------------------------------------------------
                     key_lower = key.lower()
                     if "country" in key_lower and "origin" in key_lower:
                         key = "Country of Origin"
@@ -469,23 +538,11 @@ class AmazonPDP_Spider(Spider):
                     derived_pack = None
         effective_pack = pack_qty or (str(derived_pack) if derived_pack and derived_pack > 1 else None)
 
-        # ------------------------------------------------------------------
-        # FIX: Brand fallback chain.
-        # When #bylineInfo is empty (common for some Amazon listings),
-        # try extracting from the Manufacturer field in the details table,
-        # then fall back to the first word of the product title.
-        # This reduces brand nulls from ~0% (waterfall resolver already
-        # handles most), but ensures the raw PDP JSON has a non-empty
-        # pdp_brand for edge cases.
-        # ------------------------------------------------------------------
         if not brand:
             mfr = details.get("Manufacturer", "")
             if mfr:
-                # Extract company name before first comma
-                # e.g. "Kellogg's India Pvt Ltd, PLOT NO. L2 & L3, ..." → "Kellogg's India Pvt Ltd"
                 brand = mfr.split(",")[0].strip()
         if not brand and title:
-            # Last resort: first word of title is usually the brand for FMCG products
             first_word = title.split()[0].rstrip(",!-–") if title.split() else None
             if first_word and len(first_word) > 1:
                 brand = first_word
@@ -542,7 +599,7 @@ if __name__ == "__main__":
     parser.add_argument("--mode", choices=["spec", "monitor"], default="spec",
                         help="'spec' for new product specs; 'monitor' for existing product price/stock refresh")
     parser.add_argument("--limit", type=int, default=None, help="Limit number of ASINs to scrape")
-    parser.add_argument("--batch-size", type=int, default=100, help="Number of ASINs per batch to recycle memory (default: 100)")
+    parser.add_argument("--batch-size", type=int, default=20, help="Number of ASINs per batch to recycle memory (default: 20)")
     parser.add_argument("--max-age-days", type=int, default=7, help="Max age in days before re-scraping PDP specs (default: 7)")
     parser.add_argument("--test", action="store_true", help="Run in test mode on sample diverse ASINs")
     args = parser.parse_args()
@@ -575,7 +632,7 @@ if __name__ == "__main__":
         total_asins = len(products_to_scrape)
         total_batches = (total_asins + batch_size - 1) // batch_size
         logger.info(
-            f"🚀 Loaded {total_asins} ASINs. Executing in auto-recycled batches of {batch_size} (Zero-RAM mode)..."
+            f"🚀 Loaded {total_asins} ASINs. Executing in auto-recycled batches of {batch_size} (Zero-RAM mode with fast_http)..."
         )
 
         # Single master raw run and output file for the entire execution
@@ -584,7 +641,8 @@ if __name__ == "__main__":
         total_written = 0
         t_start = time.perf_counter()
 
-        import gc
+        proxy = os.getenv("SCRAPER_PROXY") or None
+        active_cookie_header = get_amazon_clearance_cookies(proxy)
 
         try:
             for batch_idx in range(0, total_asins, batch_size):
@@ -599,7 +657,8 @@ if __name__ == "__main__":
                     products_data=chunk,
                     mode=args.mode,
                     raw_run=raw_run,
-                    output_file=output_file
+                    output_file=output_file,
+                    cookie_header=active_cookie_header
                 )
 
                 try:
@@ -612,6 +671,11 @@ if __name__ == "__main__":
                         f"✅ [BATCH {batch_num}/{total_batches}] Done ({spider.items_written} items saved). "
                         f"Cumulative saved: {total_written}/{total_asins}"
                     )
+                    # Refresh cookies if a batch returned 0 items
+                    if spider.items_written == 0 and len(chunk) > 5:
+                        logger.info("Batch yielded 0 items, refreshing clearance cookies for next batch...")
+                        active_cookie_header = get_amazon_clearance_cookies(proxy)
+                    del spider
 
                 # Force Python and OS garbage collection between batches
                 gc.collect()

@@ -145,6 +145,7 @@ class CatalogTracker:
         """
         Registers discovered ASINs with shelf_hash change detection and velocity tiering.
         If shelf_hash changes from yesterday, sets is_shelf_anomaly = 1 to trigger immediate PDP scrape.
+        Sibling variations (which have no search shelf price/title) NEVER trigger shelf anomalies or overwrite valid hashes.
         """
         if not items:
             return
@@ -157,7 +158,14 @@ class CatalogTracker:
             title = item.get("raw_title") or item.get("title") or ""
             price = item.get("raw_price") if item.get("raw_price") is not None else item.get("price")
             unit_price = item.get("raw_unit_price") if item.get("raw_unit_price") is not None else item.get("unit_price")
-            shelf_h = self.compute_shelf_hash(title, price, unit_price)
+            
+            # Sibling variations discovered on PDP pages do NOT have search shelf data.
+            # Only compute shelf_hash if this is a genuine search shelf item with price data.
+            if source == "search_shelf" and (price is not None or unit_price is not None):
+                shelf_h = self.compute_shelf_hash(title, price, unit_price)
+            else:
+                shelf_h = None
+
             tier = self.compute_velocity_tier(
                 sales_volume_tag=item.get("sales_volume_tag"),
                 reviews=item.get("raw_review_count") or item.get("reviews"),
@@ -184,12 +192,17 @@ class CatalogTracker:
                 VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?)
                 ON CONFLICT(asin) DO UPDATE SET
                     last_price_checked_at = excluded.last_price_checked_at,
-                    velocity_tier = excluded.velocity_tier,
+                    velocity_tier = CASE 
+                        WHEN excluded.discovery_source = 'search_shelf' THEN excluded.velocity_tier 
+                        ELSE catalog_asin.velocity_tier 
+                    END,
                     is_shelf_anomaly = CASE 
-                        WHEN catalog_asin.shelf_hash IS NOT NULL AND catalog_asin.shelf_hash != excluded.shelf_hash THEN 1
+                        WHEN excluded.shelf_hash IS NOT NULL 
+                             AND catalog_asin.shelf_hash IS NOT NULL 
+                             AND catalog_asin.shelf_hash != excluded.shelf_hash THEN 1
                         ELSE catalog_asin.is_shelf_anomaly
                     END,
-                    shelf_hash = excluded.shelf_hash
+                    shelf_hash = COALESCE(excluded.shelf_hash, catalog_asin.shelf_hash)
             """, records)
             conn.commit()
         logger.info(f"Registered/Refreshed {len(records)} ASINs with shelf_hash & velocity tiering.")
@@ -197,10 +210,11 @@ class CatalogTracker:
     def get_unscraped_pdp_asins(self, limit: int = None) -> list[dict]:
         """
         Returns ASINs needing full PDP specification scraping:
-        1. Brand new ASINs (last_pdp_scraped_at IS NULL)
-        2. Shelf anomalies detected today (is_shelf_anomaly = 1) -> Immediate Day 1 crawl!
-        3. Tier 1 High-velocity stale items (> 3 days old)
-        4. Tier 2 Long-tail stale items (> 7 days old)
+        1. Shelf anomalies detected today (is_shelf_anomaly = 1) -> Immediate Day 1 crawl!
+        2. Brand new Search Shelf ASINs (live customer-facing items)
+        3. Tier 1 High-velocity staples (> 3 days old)
+        4. Brand new Sibling Variations (discovered variant SKUs)
+        5. Tier 2 Long-tail stale items (> 7 days old)
         """
         query = """
             SELECT asin, search_category, leaf_node_id 
@@ -215,9 +229,11 @@ class CatalogTracker:
             ORDER BY 
               CASE 
                   WHEN is_shelf_anomaly = 1 THEN 1
-                  WHEN last_pdp_scraped_at IS NULL THEN 2
-                  WHEN velocity_tier = 1 THEN 3
-                  ELSE 4
+                  WHEN last_pdp_scraped_at IS NULL AND discovery_source = 'search_shelf' THEN 2
+                  WHEN velocity_tier = 1 AND last_pdp_scraped_at IS NOT NULL 
+                       AND (strftime('%s', 'now') - strftime('%s', last_pdp_scraped_at)) > 3 * 86400 THEN 3
+                  WHEN last_pdp_scraped_at IS NULL AND discovery_source = 'sibling_variation' THEN 4
+                  ELSE 5
               END ASC,
               last_price_checked_at DESC
         """

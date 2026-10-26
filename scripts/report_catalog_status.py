@@ -75,13 +75,22 @@ def print_report():
     tier1_count = tier_counts.get(1, 0)
     tier2_count = tier_counts.get(2, 0)
 
-    # 3. Pending Queue Breakdown (Priority Queue for PDP)
-    # P1: Never scraped
-    # P2: Shelf Anomalies
+    # 3. Pending Queue Breakdown (Aligned with CatalogTracker 5-tier priority)
+    # Never scraped breakdown: search_shelf vs sibling_variation
+    cursor.execute("SELECT count(*) FROM catalog_asin WHERE is_active = 1 AND last_pdp_scraped_at IS NULL AND discovery_source = 'search_shelf'")
+    never_scraped_search = cursor.fetchone()[0]
+
+    cursor.execute("SELECT count(*) FROM catalog_asin WHERE is_active = 1 AND last_pdp_scraped_at IS NULL AND discovery_source = 'sibling_variation'")
+    never_scraped_siblings = cursor.fetchone()[0]
+
+    # Priority 1: Shelf Anomalies (price/pack shifted today)
     cursor.execute("SELECT count(*) FROM catalog_asin WHERE is_active = 1 AND is_shelf_anomaly = 1")
     anomalies_count = cursor.fetchone()[0]
 
-    # P3: Tier 1 Stale (> 3 days)
+    # Priority 2: Brand New Search Shelf Items
+    new_search_count = never_scraped_search
+
+    # Priority 3: Tier 1 Stale (> 3 days)
     cursor.execute("""
         SELECT count(*) FROM catalog_asin 
         WHERE is_active = 1 
@@ -91,7 +100,10 @@ def print_report():
     """)
     tier1_stale = cursor.fetchone()[0]
 
-    # P4: Tier 2 Stale (> 7 days)
+    # Priority 4: Brand New Sibling Variations
+    new_siblings_count = never_scraped_siblings
+
+    # Priority 5: Tier 2 Stale (> 7 days)
     cursor.execute("""
         SELECT count(*) FROM catalog_asin 
         WHERE is_active = 1 
@@ -140,7 +152,7 @@ def print_report():
     print(f"\n{BOLD}🎯 Overall Catalog Coverage:{RESET}")
     print(f"   • Total Discovered ASINs:    {BOLD}{total_asins:,}{RESET}")
     print(f"   • Completed PDP Scrapes:     {GREEN}{BOLD}{scraped_asins:,}{RESET}")
-    print(f"   • Remaining (Never Scraped): {YELLOW}{BOLD}{never_scraped:,}{RESET}")
+    print(f"   • Remaining (Never Scraped): {YELLOW}{BOLD}{never_scraped:,}{RESET} {DIM}({never_scraped_search:,} search shelf | {never_scraped_siblings:,} sibling swatches){RESET}")
     print(f"   • Scraped in Last 24 Hours:  {CYAN}{BOLD}{scraped_last_24h:,}{RESET}")
     print(f"   • Coverage Progress:         {format_progress_bar(pct)}")
 
@@ -154,10 +166,11 @@ def print_report():
 
     print(f"\n{BOLD}📋  PDP Crawl Queue (Priority Sorting for Next Run):{RESET}")
     print(f"   • {BOLD}Total Items Currently Due:{RESET}  {MAGENTA}{BOLD}{total_queued:,}{RESET} ASINs")
-    print(f"     ├── {BOLD}Priority 1 (Brand New):{RESET}        {YELLOW}{never_scraped:,}{RESET} ASINs (never deep-scraped)")
-    print(f"     ├── {BOLD}Priority 2 (Shelf Anomalies):{RESET}  {RED}{anomalies_count:,}{RESET} ASINs (price/pack shifted today)")
-    print(f"     ├── {BOLD}Priority 3 (Stale Tier 1):{RESET}     {CYAN}{tier1_stale:,}{RESET} ASINs (> 3 days old)")
-    print(f"     └── {BOLD}Priority 4 (Stale Tier 2):{RESET}     {tier2_stale:,} ASINs (> 7 days old)")
+    print(f"     ├── {BOLD}Priority 1 (Shelf Anomalies):{RESET}      {RED if anomalies_count else GREEN}{anomalies_count:,}{RESET} ASINs (price/pack shifted today)")
+    print(f"     ├── {BOLD}Priority 2 (New Search Shelf):{RESET}     {YELLOW}{new_search_count:,}{RESET} ASINs (live search listings)")
+    print(f"     ├── {BOLD}Priority 3 (Stale Tier 1):{RESET}         {CYAN}{tier1_stale:,}{RESET} ASINs (> 3 days old staples)")
+    print(f"     ├── {BOLD}Priority 4 (New Sibling Variants):{RESET} {DIM}{new_siblings_count:,}{RESET} ASINs (discovered variant swatches)")
+    print(f"     └── {BOLD}Priority 5 (Stale Tier 2):{RESET}         {tier2_stale:,} ASINs (> 7 days old long-tail)")
 
     print(f"\n{BOLD}📁  Top Category Coverage Breakdown:{RESET}")
     print(f"   {'Category':<32} {'Discovered':<12} {'PDP Scraped':<12} {'Coverage':<10}")

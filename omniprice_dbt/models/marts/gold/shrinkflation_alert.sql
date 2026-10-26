@@ -19,11 +19,14 @@ ranked_history as (
     spec_hash,
     total_quantity,
     quantity_unit,
+    -- GUARD: quantity_source bhi lag ke saath track karo
+    quantity_source,
     valid_from,
     valid_to,
     lag(total_quantity) over (partition by asin order by valid_from) as prev_qty,
     lag(spec_hash)   over (partition by asin order by valid_from) as prev_spec,
-    lag(quantity_unit) over (partition by asin order by valid_from) as prev_unit
+    lag(quantity_unit) over (partition by asin order by valid_from) as prev_unit,
+    lag(quantity_source) over (partition by asin order by valid_from) as prev_source
   from history
 ),
 
@@ -33,6 +36,10 @@ quantity_drops as (
   where prev_qty is not null
     and total_quantity < prev_qty
     and quantity_unit = prev_unit
+    -- GUARD: quantity drop tabhi real hai jab SOURCE bhi same rahe.
+    -- net_quantity -> title flip (e.g. B09VXFB268: 45.5g -> 38g) parse-change
+    -- hai, pack-change nahi — usko alert mat banao. (545 mein se 539 false the!)
+    and quantity_source = prev_source
     and (prev_qty - total_quantity) / cast(prev_qty as double) >= 0.02
 ),
 
@@ -97,6 +104,9 @@ select
   qd.quantity_unit,
   qd.prev_qty as old_quantity,
   qd.total_quantity as new_quantity,
+  -- GUARD: audit columns — dashboard/dq me dikhai de ki quantity kahan se aayi
+  qd.prev_source as old_quantity_source,
+  qd.quantity_source as new_quantity_source,
   round((qd.prev_qty - qd.total_quantity) / nullif(qd.prev_qty, 0) * 100, 2) as shrink_pct,
   round(pre.pre_change_avg_price, 2) as old_avg_price,
   round(post.post_change_avg_price, 2) as new_avg_price,

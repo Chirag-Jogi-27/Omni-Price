@@ -59,7 +59,7 @@ echo ""
 echo "------------------------------------------------------------------------"
 echo "🔍 STEP 2: Running Amazon PDP Spider (Spec Deep-Dive)..."
 echo "------------------------------------------------------------------------"
-python3 -m scrapers.amazon_pdp_spider --mode spec --limit 2000 --max-age-days 7
+python3 -m scrapers.amazon_pdp_spider --mode spec --limit 2000 --batch-size 20
 
 # ------------------------------------------------------------------------------
 # STEP 3: Sync Raw Data to Databricks Unity Catalog Volume

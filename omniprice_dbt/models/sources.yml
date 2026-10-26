@@ -1,6 +1,10 @@
 version: 2
 
 sources:
+  - name: bronze
+    schema: bronze
+    tables:      
+      - name: pdp_events
   - name: silver
     database: omniprice
     schema: silver
